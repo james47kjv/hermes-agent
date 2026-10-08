@@ -6,11 +6,21 @@ loop, no tools on the wire, no continuation/retry, no session/transcript, no mem
 files. The caller supplies only an instruction + prompt (the authorized task evidence); it cannot pick
 a provider, model, price, tool, callback or stream.
 
-Authority is minted elsewhere. The product (legal-api) admits the call against its existing delegated
-grant + inherited budget, then signs the binding with the profile-scoped secret
-``SEAT_ADMISSION_SECRET``. This module stores no grant or budget: it verifies the signature, the TTL,
-the input digest and the bounds, then records a metadata-only outcome keyed by the admission key so a
-lost response is never re-invoked (a repeat key answers 409 with the recorded state).
+Authority is canonical and lives elsewhere. The product (legal-api) admits the call against its existing
+delegated grant + inherited budget (one row, ``terminal_delegated_grants``) and signs the binding with the
+profile-scoped secret ``SEAT_ADMISSION_SECRET``. A signature is NOT authority on its own: immediately before
+the SDK is constructed, inside the dispatch worker, this module asks the operator-configured canonical
+authority (``SEAT_AUTHORITY_URL``, never a caller-supplied URL) to verify and consume that exact admission
+against the CURRENT grant row (revocation, expiry, issuer session, scope, task/run pin, admitted cost,
+input digest, output bound, cancellation, one-time dispatch). Only a signed ``admitted`` verdict bound to a
+fresh nonce lets the call proceed, and the admission expiry is re-checked after that verdict. This module
+stores no grant or budget: it records a metadata-only outcome keyed by the admission key so a lost response
+is never re-invoked (a repeat key answers 409 with the recorded state).
+
+Privacy: during the single invocation (and the authority exchange) every record from the provider SDK and
+HTTP-stack loggers (openai*, anthropic*, httpx*, httpcore*) is dropped by a filter keyed on a context
+variable that is set only in the dispatching worker, so request/response/error bodies never reach logs
+while concurrent ordinary traffic in other threads/tasks keeps its normal logging.
 
 Bounds are enforced where they cost money: the provider request carries the output cap
 (``max_tokens`` / ``max_output_tokens``) and no tools, asserted on the final kwargs immediately before
@@ -21,12 +31,14 @@ this module does not drive is reported unavailable; nothing falls back to the ag
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import functools
 import hashlib
 import hmac
 import json
 import logging
 import re
+import secrets
 import sqlite3
 import threading
 import time
@@ -49,14 +61,22 @@ CLOCK_SKEW_S = 5
 MAX_BODY_BYTES = 1_400_000
 PROVIDER_TIMEOUT_S = 300.0
 SECRET_NAME = "SEAT_ADMISSION_SECRET"
+AUTHORITY_URL_NAME = "SEAT_AUTHORITY_URL"
 MIN_SECRET_LEN = 32
+AUTHORITY_TIMEOUT_S = 10.0
+# Domain separation: an admission signature can never be replayed as an authority request or verdict.
+ADMISSION_DOMAIN = CONTRACT + "/admission"
+AUTHORITY_REQUEST_DOMAIN = CONTRACT + "/authority-request"
+AUTHORITY_VERDICT_DOMAIN = CONTRACT + "/authority-verdict"
+_PRIVATE_LOGGER_PREFIXES = ("openai", "anthropic", "httpx", "httpcore")
 
 _HEX64 = re.compile(r"[0-9a-f]{64}")
 _ID = re.compile(r"[A-Za-z0-9._:@/-]{1,200}")
 _BODY_KEYS = frozenset({"contract", "binding", "input", "input_sha256", "max_output_tokens", "admission_signature"})
 _BINDING_KEYS = frozenset({
     "tenant_id", "matter_id", "principal_id", "task_id", "run_id", "capability_id", "capability_version",
-    "audience", "admission_key", "admitted_cost_microunits", "issued_at", "expires_at"})
+    "delegation_ref", "operation_id", "seat_route_sha256", "audience", "admission_key", "admitted_cost_microunits", "issued_at",
+    "expires_at"})
 _INPUT_KEYS = frozenset({"instruction", "prompt"})
 _CODEX_BACKEND_MARKER = "chatgpt.com/backend-api/codex"
 
@@ -79,11 +99,17 @@ def input_digest(seat_input: Dict[str, str]) -> str:
     return hashlib.sha256(canonical(seat_input)).hexdigest()
 
 
+def sign(secret: str, domain: str, payload: Dict[str, Any]) -> str:
+    """HMAC-SHA256 over ``canonical({"domain": domain, "payload": payload})``."""
+    return hmac.new(secret.encode("utf-8"), canonical({"domain": domain, "payload": payload}),
+                    hashlib.sha256).hexdigest()
+
+
 def admission_signature(secret: str, *, binding: Dict[str, Any], input_sha256: str,
                         max_output_tokens: int) -> str:
     payload = {"contract": CONTRACT, "binding": binding, "input_sha256": input_sha256,
                "max_output_tokens": max_output_tokens}
-    return hmac.new(secret.encode("utf-8"), canonical(payload), hashlib.sha256).hexdigest()
+    return sign(secret, ADMISSION_DOMAIN, payload)
 
 
 def _is_int(value: Any) -> bool:
@@ -102,6 +128,21 @@ def _admission_secret() -> str:
     return value if has_usable_secret(value, min_length=MIN_SECRET_LEN) else ""
 
 
+def _authority_url() -> str:
+    """Operator-configured canonical authority endpoint (profile-scoped); empty when absent/invalid.
+
+    It is configuration, never request data: the caller cannot name a callback.
+    """
+    from agent.secret_scope import UnscopedSecretError, get_secret
+    try:
+        value = (get_secret(AUTHORITY_URL_NAME, "") or "").strip()
+    except UnscopedSecretError:
+        return ""
+    if not re.fullmatch(r"https?://[A-Za-z0-9.\-\[\]:]+(/[A-Za-z0-9._~/\-]*)?", value):
+        return ""
+    return value
+
+
 # -- request validation (pure; every refusal happens before the ledger or the provider) -----------------
 
 def _validate_shape(body: Any) -> Tuple[Dict[str, Any], Dict[str, str], int]:
@@ -115,15 +156,20 @@ def _validate_shape(body: Any) -> Tuple[Dict[str, Any], Dict[str, str], int]:
         raise SeatRefused(400, "malformed_seat_input")
     if not _is_int(max_out) or not 1 <= max_out <= MAX_OUTPUT_TOKENS:
         raise SeatRefused(400, "output_bound_invalid")
-    for key in ("tenant_id", "matter_id", "principal_id", "task_id", "run_id", "capability_id"):
+    for key in ("tenant_id", "matter_id", "principal_id", "task_id", "run_id", "capability_id", "operation_id"):
         if not isinstance(binding[key], str) or not _ID.fullmatch(binding[key]):
             raise SeatRefused(400, "malformed_seat_binding")
     if not _is_int(binding["capability_version"]) or binding["capability_version"] < 1:
         raise SeatRefused(400, "malformed_seat_binding")
     if not isinstance(binding["admission_key"], str) or not _HEX64.fullmatch(binding["admission_key"]):
         raise SeatRefused(400, "malformed_seat_binding")
+    if not isinstance(binding["seat_route_sha256"], str) or not _HEX64.fullmatch(binding["seat_route_sha256"]):
+        raise SeatRefused(400, "malformed_seat_binding")
+    ref = binding["delegation_ref"]  # opaque one-way grant reference; the authority resolves it, Hermes never does
+    if not isinstance(ref, str) or not ref.startswith("grant-sha256:") or not _HEX64.fullmatch(ref[13:]):
+        raise SeatRefused(400, "malformed_seat_binding")
     cost = binding["admitted_cost_microunits"]
-    if not _is_int(cost) or not 0 <= cost < 10 ** 15:
+    if not _is_int(cost) or not 1 <= cost < 10 ** 15:
         raise SeatRefused(400, "cost_admission_invalid")
     for key in ("issued_at", "expires_at"):
         if not _is_int(binding[key]) or binding[key] <= 0:
@@ -146,17 +192,22 @@ def validate_request(body: Any, *, secret: str, now: Optional[float] = None) -> 
         raise SeatRefused(403, "admission_not_authorized")
     if binding["audience"] != "private":
         raise SeatRefused(403, "audience_not_authorized")
-    current = time.time() if now is None else now
-    issued, expires = binding["issued_at"], binding["expires_at"]
-    if (issued > current + CLOCK_SKEW_S or expires <= current or expires <= issued
-            or expires - issued > MAX_ADMISSION_TTL_S):
-        raise SeatRefused(403, "admission_expired")
+    check_admission_window(binding, now)
     size = sum(len(seat_input[k].encode("utf-8")) for k in _INPUT_KEYS)
     if size > MAX_INPUT_BYTES:
         raise SeatRefused(413, "input_bound_exceeded")
     if not hmac.compare_digest(input_digest(seat_input), body["input_sha256"]):
         raise SeatRefused(400, "input_digest_mismatch")
     return binding, seat_input, max_out
+
+
+def check_admission_window(binding: Dict[str, Any], now: Optional[float] = None) -> None:
+    """TTL window. Called at request validation AND again at dispatch, after every wait."""
+    current = time.time() if now is None else now
+    issued, expires = binding["issued_at"], binding["expires_at"]
+    if (issued > current + CLOCK_SKEW_S or expires <= current or expires <= issued
+            or expires - issued > MAX_ADMISSION_TTL_S):
+        raise SeatRefused(403, "admission_expired")
 
 
 # -- configured seat runtime --------------------------------------------------------------------------
@@ -185,6 +236,16 @@ def unsupported_reason(runtime: Optional[Dict[str, Any]]) -> Optional[str]:
     return None
 
 
+def seat_route(runtime: Dict[str, Any]) -> Dict[str, str]:
+    """The owner-configured route an admission is bound to (no credential, no URL secrets)."""
+    return {"provider": str(runtime.get("provider") or ""), "api_mode": str(runtime.get("api_mode") or ""),
+            "model": str(runtime.get("model") or "")}
+
+
+def seat_route_sha256(runtime: Dict[str, Any]) -> str:
+    return hashlib.sha256(canonical(seat_route(runtime))).hexdigest()
+
+
 def resolve_seat_runtime() -> Optional[Dict[str, Any]]:
     """The profile's own configured provider/model; no fallback chain, no request override."""
     from hermes_cli.runtime_provider import _get_model_config, resolve_runtime_provider
@@ -207,6 +268,88 @@ def _resolve_or_none() -> Optional[Dict[str, Any]]:
     except Exception as exc:
         logger.warning("seat runtime resolution failed: %s", type(exc).__name__)
         return None
+
+
+# -- privacy at the SDK / HTTP-stack boundary ----------------------------------------------------------
+
+# True only inside the worker that performs the authority exchange and the one provider invocation.
+# asyncio.to_thread copies the context, so setting it there never leaks into other tasks or threads.
+_PRIVATE_CALL: contextvars.ContextVar[bool] = contextvars.ContextVar("seat_private_call", default=False)
+
+
+class _PrivateCallFilter(logging.Filter):
+    """Drops SDK/HTTP-stack records emitted by the private call's own thread/context only."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return not (_PRIVATE_CALL.get() and record.name.split(".", 1)[0] in _PRIVATE_LOGGER_PREFIXES)
+
+
+_PRIVATE_FILTER = _PrivateCallFilter()
+_guard_lock = threading.Lock()
+
+
+def _guard_private_logging() -> None:
+    """Attach the context-keyed filter to every SDK/HTTP logger and every root handler (idempotent).
+
+    Logger filters cover records at their origin; handler filters cover propagated records from child
+    loggers created after this scan. No level is changed, so ordinary traffic logs exactly as before.
+    """
+    with _guard_lock:
+        manager = logging.Logger.manager
+        names = [n for n in list(manager.loggerDict) if n.split(".", 1)[0] in _PRIVATE_LOGGER_PREFIXES]
+        loggers = [logging.getLogger(n) for n in (*_PRIVATE_LOGGER_PREFIXES, *names)]
+        handlers = list(logging.getLogger().handlers)
+        if logging.lastResort is not None:  # used when no handler is configured at all
+            handlers.append(logging.lastResort)
+        for lg in loggers:
+            handlers.extend(lg.handlers)
+        for target in (*loggers, *handlers):
+            if _PRIVATE_FILTER not in target.filters:
+                target.addFilter(_PRIVATE_FILTER)
+
+
+# -- canonical authority at dispatch -------------------------------------------------------------------
+
+def _authority_client() -> Any:
+    import httpx
+    return httpx.Client(timeout=AUTHORITY_TIMEOUT_S, trust_env=False, follow_redirects=False)
+
+
+def _refusal_code(value: Any) -> str:
+    code = value.get("code") if isinstance(value, dict) else None
+    return code if isinstance(code, str) and re.fullmatch(r"[a-z_]{1,64}", code) else "admission_not_authorized"
+
+
+def authorize_at_dispatch(secret: str, url: str, *, binding: Dict[str, Any], input_sha256: str, max_out: int,
+                          admission_signature_hex: str, runtime: Dict[str, Any]) -> None:
+    """Ask the canonical product authority to verify AND consume this exact admission, now.
+
+    The authority re-reads the current delegated grant (revocation, expiry, issuer session, scope, task/run
+    pin, admitted cost, bound input digest/output cap, cancellation) and marks the admission dispatched
+    once. Only a verdict signed over this request's digest and fresh nonce admits the call; anything else
+    (refusal, transport loss, unreadable or unsigned reply) refuses BEFORE any SDK client exists.
+    """
+    import httpx
+    request = {"contract": CONTRACT, "binding": binding, "input_sha256": input_sha256,
+               "max_output_tokens": max_out, "admission_signature": admission_signature_hex,
+               "nonce": secrets.token_hex(32), "requested_at": int(time.time()),
+               "seat_route": seat_route(runtime)}
+    body = canonical({"request": request, "request_signature": sign(secret, AUTHORITY_REQUEST_DOMAIN, request)})
+    try:
+        with _authority_client() as client:
+            response = client.post(url, content=body, headers={"Content-Type": "application/json"})
+        verdict = response.json()
+    except (httpx.HTTPError, ValueError):
+        raise SeatRefused(503, "seat_authority_unavailable") from None
+    if response.status_code != 200:
+        raise SeatRefused(503 if response.status_code >= 500 else 403, _refusal_code(verdict))
+    expected = {"verdict": "admitted", "request_sha256": hashlib.sha256(canonical(request)).hexdigest(),
+                "nonce": request["nonce"]}
+    signature = verdict.get("authority_signature") if isinstance(verdict, dict) else None
+    if (not isinstance(verdict, dict) or set(verdict) != {*expected, "authority_signature"}
+            or any(verdict[k] != v for k, v in expected.items()) or not isinstance(signature, str)
+            or not hmac.compare_digest(sign(secret, AUTHORITY_VERDICT_DOMAIN, expected), signature)):
+        raise SeatRefused(403, "authority_verdict_invalid")
 
 
 # -- the single invocation ----------------------------------------------------------------------------
@@ -306,10 +449,14 @@ def _responses_result(response: Any) -> Dict[str, Any]:
 
 
 # api_mode -> (request builder, client factory, client -> create callable, result normalizer)
+# Client factories are looked up at call time so one module-level seam builds every SDK client.
 _DRIVERS: Dict[str, Tuple[Callable, Callable, Callable, Callable]] = {
-    "anthropic_messages": (_anthropic_request, _anthropic_client, lambda c: c.messages.create, _anthropic_result),
-    "chat_completions": (_chat_request, _openai_client, lambda c: c.chat.completions.create, _chat_result),
-    "codex_responses": (_responses_request, _openai_client, lambda c: c.responses.create, _responses_result),
+    "anthropic_messages": (_anthropic_request, lambda rt: _anthropic_client(rt), lambda c: c.messages.create,
+                           _anthropic_result),
+    "chat_completions": (_chat_request, lambda rt: _openai_client(rt), lambda c: c.chat.completions.create,
+                         _chat_result),
+    "codex_responses": (_responses_request, lambda rt: _openai_client(rt), lambda c: c.responses.create,
+                        _responses_result),
 }
 
 
@@ -327,6 +474,7 @@ def invoke_once(runtime: Dict[str, Any], seat_input: Dict[str, str], max_out: in
     request = build(runtime, seat_input, max_out)
     _assert_bounded(runtime["api_mode"], request, max_out)
     client = make_client(runtime)
+    _guard_private_logging()  # after construction: every SDK/HTTP logger now exists
     try:
         response = create(client)(**request)
     except Exception as exc:
@@ -392,7 +540,7 @@ def claim(key: str, binding_sha256: str, runtime: Dict[str, Any], cost: int) -> 
             conn.close()
 
 
-def settle(key: str, state: str, result: Optional[Dict[str, Any]] = None) -> None:
+def settle(key: str, state: str, result: Optional[Dict[str, Any]] = None, *, finish: Optional[str] = None) -> None:
     usage = (result or {}).get("usage") or {}
     text = (result or {}).get("text")
     with _ledger_lock:
@@ -401,7 +549,7 @@ def settle(key: str, state: str, result: Optional[Dict[str, Any]] = None) -> Non
             conn.execute(
                 "UPDATE seat_completion SET state=?, finish=?, input_tokens=?, output_tokens=?, output_sha256=?, "
                 "provider_request_id=?, updated_at=? WHERE admission_key=? AND state='dispatching'",
-                (state, (result or {}).get("finish"), usage.get("input_tokens"), usage.get("output_tokens"),
+                (state, finish or (result or {}).get("finish"), usage.get("input_tokens"), usage.get("output_tokens"),
                  hashlib.sha256(text.encode("utf-8")).hexdigest() if isinstance(text, str) and result else None,
                  _bounded_id((result or {}).get("provider_request_id")), time.time(), key))
         finally:
@@ -412,10 +560,45 @@ def _bounded_id(value: Any) -> Optional[str]:
     return value[:200] if isinstance(value, str) and value and not any(c.isspace() for c in value) else None
 
 
-def dispatch_and_settle(key: str, runtime: Dict[str, Any], seat_input: Dict[str, str],
-                        max_out: int) -> Tuple[str, Optional[Dict[str, Any]]]:
-    """Run the one invocation for an already-claimed key and durably settle it. Never retries."""
+class Admission:
+    """Everything the dispatch worker needs to re-prove authority after the request-time checks."""
+
+    def __init__(self, *, binding: Dict[str, Any], input_sha256: str, max_out: int, signature: str,
+                 secret: str, authority_url: str):
+        self.binding, self.input_sha256, self.max_out = binding, input_sha256, max_out
+        self.signature, self.secret, self.authority_url = signature, secret, authority_url
+
+
+def dispatch_and_settle(key: str, runtime: Dict[str, Any], seat_input: Dict[str, str], max_out: int,
+                        admission: Admission) -> Tuple[str, Optional[Dict[str, Any]], Optional[str]]:
+    """For an already-claimed key: re-check the window, obtain the canonical authority's verdict, re-check
+    the window again, then run the one invocation, and durably settle. Never retries.
+
+    Runs in its own worker context: the private-logging flag set here is invisible to every other request.
+    """
+    token = _PRIVATE_CALL.set(True)
+    try:
+        return _dispatch_private(key, runtime, seat_input, max_out, admission)
+    finally:
+        _PRIVATE_CALL.reset(token)
+
+
+def _dispatch_private(key: str, runtime: Dict[str, Any], seat_input: Dict[str, str], max_out: int,
+                      admission: Admission) -> Tuple[str, Optional[Dict[str, Any]], Optional[str]]:
+    _guard_private_logging()
     result: Optional[Dict[str, Any]] = None
+    try:
+        # Admission time may have passed while runtime resolution, the claim or the thread queue waited.
+        check_admission_window(admission.binding)
+        authorize_at_dispatch(admission.secret, admission.authority_url, binding=admission.binding,
+                              input_sha256=admission.input_sha256, max_out=max_out,
+                              admission_signature_hex=admission.signature, runtime=runtime)
+        check_admission_window(admission.binding)  # the authority exchange itself took time
+    except SeatRefused as refused:
+        # Definite: no provider client was constructed. The key stays burned (never re-dispatched).
+        settle(key, "refused", finish=refused.code)
+        _log(key, "refused", runtime)
+        return "refused", None, refused.code
     try:
         result = invoke_once(runtime, seat_input, max_out)
         state = "completed" if result["complete"] else "incomplete"
@@ -426,7 +609,7 @@ def dispatch_and_settle(key: str, runtime: Dict[str, Any], seat_input: Dict[str,
         state = "unknown"
     settle(key, state, result)
     _log(key, state, runtime, result)
-    return state, result
+    return state, result, None
 
 
 def readback(key: str) -> Optional[Dict[str, Any]]:
@@ -448,6 +631,8 @@ def readback(key: str) -> Optional[Dict[str, Any]]:
             "usage": {"input_tokens": row["input_tokens"], "output_tokens": row["output_tokens"]},
             "output_sha256": row["output_sha256"], "provider_request_id": row["provider_request_id"],
             # The output text is never retained; a completed call whose response was lost is unrecoverable.
+            # "refused" is decided before any SDK client exists; every other state may have reached it.
+            "provider_invoked": False if state == "refused" else None if state in ("dispatching", "unknown") else True,
             "output_retained": False, "resubmission_allowed": False}
 
 
@@ -495,12 +680,19 @@ async def handle_seat_completion(adapter: Any, request: "web.Request") -> "web.R
         body = json.loads(raw, parse_constant=_reject_constant)
     except (ValueError, UnicodeDecodeError):
         return _error(400, "malformed_seat_request")
+    secret = _admission_secret()
     try:
-        binding, seat_input, max_out = validate_request(body, secret=_admission_secret())
+        binding, seat_input, max_out = validate_request(body, secret=secret)
+        authority_url = _authority_url()
+        if not authority_url:
+            raise SeatRefused(503, "seat_contract_unavailable")
         runtime = await asyncio.to_thread(_resolve_or_none)
         reason = unsupported_reason(runtime)
         if reason is not None:
             raise SeatRefused(503, reason)
+        if not hmac.compare_digest(seat_route_sha256(runtime), binding["seat_route_sha256"]):
+            # The configured seat changed since the product admitted the call: never run it on another route.
+            raise SeatRefused(409, "seat_route_changed")
     except SeatRefused as refused:
         return _error(refused.status, refused.code)
     key = binding["admission_key"]
@@ -509,10 +701,16 @@ async def handle_seat_completion(adapter: Any, request: "web.Request") -> "web.R
     if existing is not None:
         conflict = "admission_key_conflict" if existing["binding_sha256"] != binding_sha256 else "admission_already_used"
         return _error(409, conflict, outcome=await asyncio.to_thread(readback, key))
-    # The worker thread settles its own outcome, so a client disconnect (task cancellation) cannot
-    # leave a finished call unrecorded; the awaiting coroutine only relays it.
-    state, result = await asyncio.to_thread(dispatch_and_settle, key, runtime, seat_input, max_out)
+    admission = Admission(binding=binding, input_sha256=body["input_sha256"], max_out=max_out,
+                          signature=body["admission_signature"], secret=secret, authority_url=authority_url)
+    # The worker thread re-proves authority and settles its own outcome, so neither a wait before dispatch
+    # nor a client disconnect (task cancellation) can turn a stale admission into a call or lose a result.
+    state, result, refusal = await asyncio.to_thread(dispatch_and_settle, key, runtime, seat_input, max_out,
+                                                     admission)
     outcome = await asyncio.to_thread(readback, key)
+    if state == "refused":
+        return _error(503 if refusal == "seat_authority_unavailable" else 403, refusal or "admission_not_authorized",
+                      outcome=outcome)
     if state == "failed":
         return _error(502, "provider_rejected", outcome=outcome)
     if state == "unknown":
@@ -536,11 +734,13 @@ async def handle_seat_readback(adapter: Any, request: "web.Request") -> "web.Res
 
 
 async def handle_seat_contract(adapter: Any, request: "web.Request") -> "web.Response":
-    """Discovery: available only when the secret and a cap-enforcing configured route both exist."""
+    """Discovery: available only when the secret, the canonical authority and a cap-enforcing route all exist."""
     auth_err = adapter._check_auth(request)
     if auth_err is not None:
         return auth_err
     reason: Optional[str] = None if _admission_secret() else "seat_admission_secret_unconfigured"
+    if reason is None and not _authority_url():
+        reason = "seat_authority_unconfigured"
     runtime = None
     if reason is None:
         runtime = await asyncio.to_thread(_resolve_or_none)
@@ -548,8 +748,11 @@ async def handle_seat_contract(adapter: Any, request: "web.Request") -> "web.Res
     return web.json_response({
         "contract": CONTRACT, "available": reason is None, "reason": reason,
         "api_mode": (runtime or {}).get("api_mode") if reason is None else None,
+        # The route the product binds an admission to; never a credential or base URL.
+        "seat_route": seat_route(runtime) if reason is None and runtime else None,
         "max_input_bytes": MAX_INPUT_BYTES, "max_output_tokens": MAX_OUTPUT_TOKENS,
-        "max_admission_ttl_seconds": MAX_ADMISSION_TTL_S, "tools": [], "invocations_per_admission": 1})
+        "max_admission_ttl_seconds": MAX_ADMISSION_TTL_S, "tools": [], "invocations_per_admission": 1,
+        "authority": "canonical_at_dispatch"})
 
 
 def _http_routes(adapter: Any) -> list:
