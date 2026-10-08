@@ -137,8 +137,7 @@ from gateway.config import Platform, PlatformConfig
 from gateway.display_config import resolve_display_setting
 from gateway.platforms import api_server_room_dispatch as _room_dispatch
 from gateway.platforms import api_server_room_grants as _room_grants
-from gateway.platforms import api_server_runs as _api_runs
-from gateway.platforms import api_server_seat_completion as _seat_completion
+from gateway.platforms import api_server_runs as _api_runs, api_server_seat_completion as _seat_completion
 from gateway.platforms.api_server_openai_routes import OpenAICompatRoutesMixin
 from gateway.platforms.api_server_memory_sessions import ApiServerMemorySessions
 from gateway.platforms.base import (
@@ -1759,10 +1758,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             ("POST", "/api/jobs/{job_id}/pause", self._handle_pause_job),
             ("POST", "/api/jobs/{job_id}/resume", self._handle_resume_job),
             ("POST", "/api/jobs/{job_id}/run", self._handle_run_job)]
-        routes.extend(_room_grants._http_routes(self))
-        routes.extend(_api_runs._http_routes(self))
-        # Bounded single seat completion: separate from agent chat, never runs the agent loop.
-        routes.extend(_seat_completion._http_routes(self))
+        for sibling in (_room_grants, _api_runs, _seat_completion):  # seat: bounded, never the agent loop
+            routes.extend(sibling._http_routes(self))
         if _CRON_AVAILABLE:
             # Chronos fire webhook (NAS -> agent): authenticated by a NAS-minted JWT.
             routes.append(("POST", "/api/cron/fire", self._handle_cron_fire))

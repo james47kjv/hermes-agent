@@ -92,12 +92,12 @@ def _is_int(value: Any) -> bool:
 
 def _admission_secret() -> str:
     """Profile-scoped secret; empty (unavailable) when missing or weak. Never logged."""
+    from agent.secret_scope import UnscopedSecretError, get_secret
+    from hermes_cli.auth import has_usable_secret
     try:
-        from agent.secret_scope import get_secret
-        from hermes_cli.auth import has_usable_secret
         value = get_secret(SECRET_NAME, "") or ""
-    except Exception as exc:
-        logger.warning("seat completion secret unavailable: %s", type(exc).__name__)
+    except UnscopedSecretError:
+        logger.warning("seat completion secret unavailable: no profile scope bound")
         return ""
     return value if has_usable_secret(value, min_length=MIN_SECRET_LEN) else ""
 
@@ -197,6 +197,16 @@ def resolve_seat_runtime() -> Optional[Dict[str, Any]]:
     return {"provider": runtime.get("provider"), "api_mode": runtime.get("api_mode"),
             "base_url": runtime.get("base_url") or "", "api_key": runtime.get("api_key"),
             "command": runtime.get("command"), "args": list(runtime.get("args") or []), "model": model}
+
+
+def _resolve_or_none() -> Optional[Dict[str, Any]]:
+    """Unresolvable seat runtime is reported unavailable, never an agent-chat fallback."""
+    try:
+        return resolve_seat_runtime()
+    # health: allow BLE001 -- availability boundary over the whole provider-resolution ladder (auth, config, pool errors); every failure means "unavailable" and only the type is logged because resolver messages can name credential sources
+    except Exception as exc:
+        logger.warning("seat runtime resolution failed: %s", type(exc).__name__)
+        return None
 
 
 # -- the single invocation ----------------------------------------------------------------------------
@@ -411,8 +421,8 @@ def dispatch_and_settle(key: str, runtime: Dict[str, Any], seat_input: Dict[str,
         state = "completed" if result["complete"] else "incomplete"
     except ProviderRejected:
         state = "failed"
-    except BaseException:
-        # The request may have reached the provider; the key stays spent and is reported unknown.
+    # health: allow BLE001 -- settlement boundary: any failure after the claim may follow a sent request, so it is recorded as unknown (never retried); the traceback is not logged because provider error text can echo private matter content
+    except Exception:
         state = "unknown"
     settle(key, state, result)
     _log(key, state, runtime, result)
@@ -487,11 +497,7 @@ async def handle_seat_completion(adapter: Any, request: "web.Request") -> "web.R
         return _error(400, "malformed_seat_request")
     try:
         binding, seat_input, max_out = validate_request(body, secret=_admission_secret())
-        try:
-            runtime = await asyncio.to_thread(resolve_seat_runtime)
-        except Exception as exc:
-            logger.warning("seat runtime resolution failed: %s", type(exc).__name__)
-            runtime = None
+        runtime = await asyncio.to_thread(_resolve_or_none)
         reason = unsupported_reason(runtime)
         if reason is not None:
             raise SeatRefused(503, reason)
@@ -537,10 +543,7 @@ async def handle_seat_contract(adapter: Any, request: "web.Request") -> "web.Res
     reason: Optional[str] = None if _admission_secret() else "seat_admission_secret_unconfigured"
     runtime = None
     if reason is None:
-        try:
-            runtime = await asyncio.to_thread(resolve_seat_runtime)
-        except Exception:
-            runtime = None
+        runtime = await asyncio.to_thread(_resolve_or_none)
         reason = unsupported_reason(runtime)
     return web.json_response({
         "contract": CONTRACT, "available": reason is None, "reason": reason,

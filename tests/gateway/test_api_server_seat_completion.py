@@ -236,57 +236,58 @@ def _resign(body, binding):
                  max_out=body["max_output_tokens"])
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize("case,expected", [
-    ("unsigned_scope_change", (403, "admission_not_authorized")),
-    ("wrong_secret", (403, "admission_not_authorized")),
-    ("expired", (403, "admission_expired")),
-    ("ttl_too_long", (403, "admission_expired")),
-    ("future_issue", (403, "admission_expired")),
-    ("shared_audience", (403, "audience_not_authorized")),
-    ("negative_cost", (400, "cost_admission_invalid")),
-    ("float_cost", (400, "cost_admission_invalid")),
-    ("output_over_cap", (400, "output_bound_invalid")),
-    ("input_over_cap", (413, "input_bound_exceeded")),
-    ("digest_mismatch", (400, "input_digest_mismatch")),
-    ("missing_binding_field", (400, "malformed_seat_binding")),
-    ("bad_admission_key", (400, "malformed_seat_binding")),
-    ("wrong_contract", (400, "malformed_seat_request")),
-])
-async def test_invalid_admissions_refuse_before_model_call(adapter, sdk, runtime, case, expected):
-    now = int(time.time())
+def _tampered(field, value):
     body = _body()
-    if case == "unsigned_scope_change":
-        body["binding"]["matter_id"] = "matter-2"  # signature was for matter-1
-    elif case == "wrong_secret":
-        body = _body(secret=secrets.token_hex(32))
-    elif case == "expired":
-        body = _body(binding=_binding(issued_at=now - 90, expires_at=now - 30))
-    elif case == "ttl_too_long":
-        body = _body(binding=_binding(issued_at=now, expires_at=now + seat.MAX_ADMISSION_TTL_S + 1))
-    elif case == "future_issue":
-        body = _body(binding=_binding(issued_at=now + 120, expires_at=now + 150))
-    elif case == "shared_audience":
-        body = _body(binding=_binding(audience="matter"))
-    elif case == "negative_cost":
-        body = _body(binding=_binding(admitted_cost_microunits=-1))
-    elif case == "float_cost":
-        body = _body(binding=_binding(admitted_cost_microunits=1.5))
-    elif case == "output_over_cap":
-        body = _body(max_out=seat.MAX_OUTPUT_TOKENS + 1)
-    elif case == "input_over_cap":
-        body = _body(prompt="é" * (seat.MAX_INPUT_BYTES // 2 + 1))
-    elif case == "digest_mismatch":
-        body["input"]["prompt"] = PROMPT + " tampered"
-    elif case == "missing_binding_field":
-        binding = _binding()
-        del binding["run_id"]
-        body = _body(binding=binding)
-    elif case == "bad_admission_key":
-        body = _body(binding=_binding(admission_key="not-a-digest"))
-    elif case == "wrong_contract":
-        body["contract"] = "hermes.seat_completion.v0"
-    status, payload = await _post(adapter, body)
+    body["binding"][field] = value  # changed after signing
+    return body
+
+
+def _without_run_id():
+    binding = _binding()
+    del binding["run_id"]
+    return _body(binding=binding)
+
+
+def _tampered_prompt():
+    body = _body()
+    body["input"]["prompt"] = PROMPT + " tampered"
+    return body
+
+
+def _wrong_contract():
+    body = _body()
+    body["contract"] = "hermes.seat_completion.v0"
+    return body
+
+
+def _at(offset_issued, offset_expires):
+    now = int(time.time())
+    return _body(binding=_binding(issued_at=now + offset_issued, expires_at=now + offset_expires))
+
+
+REFUSALS = {
+    "unsigned_scope_change": (lambda: _tampered("matter_id", "matter-2"), (403, "admission_not_authorized")),
+    "wrong_secret": (lambda: _body(secret=secrets.token_hex(32)), (403, "admission_not_authorized")),
+    "expired": (lambda: _at(-90, -30), (403, "admission_expired")),
+    "ttl_too_long": (lambda: _at(0, seat.MAX_ADMISSION_TTL_S + 1), (403, "admission_expired")),
+    "future_issue": (lambda: _at(120, 150), (403, "admission_expired")),
+    "shared_audience": (lambda: _body(binding=_binding(audience="matter")), (403, "audience_not_authorized")),
+    "negative_cost": (lambda: _body(binding=_binding(admitted_cost_microunits=-1)), (400, "cost_admission_invalid")),
+    "float_cost": (lambda: _body(binding=_binding(admitted_cost_microunits=1.5)), (400, "cost_admission_invalid")),
+    "output_over_cap": (lambda: _body(max_out=seat.MAX_OUTPUT_TOKENS + 1), (400, "output_bound_invalid")),
+    "input_over_cap": (lambda: _body(prompt="é" * (seat.MAX_INPUT_BYTES // 2 + 1)), (413, "input_bound_exceeded")),
+    "digest_mismatch": (_tampered_prompt, (400, "input_digest_mismatch")),
+    "missing_binding_field": (_without_run_id, (400, "malformed_seat_binding")),
+    "bad_admission_key": (lambda: _body(binding=_binding(admission_key="not-a-digest")), (400, "malformed_seat_binding")),
+    "wrong_contract": (_wrong_contract, (400, "malformed_seat_request")),
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", sorted(REFUSALS))
+async def test_invalid_admissions_refuse_before_model_call(adapter, sdk, runtime, case):
+    make_body, expected = REFUSALS[case]
+    status, payload = await _post(adapter, make_body())
     assert (status, payload["error"]["code"]) == expected
     assert sdk.calls == [] and sdk.clients == [] and _ledger_rows() == []
 
